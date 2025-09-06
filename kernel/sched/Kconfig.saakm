@@ -1,0 +1,19 @@
+
+config SAAKM_DEBUG_TOPOLOGY
+        def_bool n
+	prompt "Print topology during boot"
+
+config SAAKM_PANIC_ON_BAD_TRANSITION
+        def_bool n
+	prompt "Panic when a bad transition in the saakm finite state machine is detected. Use for debug only."
+
+config CGROUP_SAAKM
+       def_bool y
+       prompt "SaaKM controller"
+       depends on CGROUPS
+
+menu "SaaKM policies"
+
+source "kernel/sched/saakm/Kconfig"
+
+endmenu

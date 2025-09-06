@@ -1,0 +1,1234 @@
+// SPDX-License-Identifier: GPL-2.0
+#define pr_fmt(fmt) "saakm[" KBUILD_MODNAME "]: " fmt
+
+#include <linux/delay.h>
+#include <linux/saakm.h>
+#include <linux/ktime.h>
+#include <linux/lockdep.h>
+#include <linux/module.h>
+#include <linux/proc_fs.h>
+#include <linux/sched.h>
+#include <linux/sched/task.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/sort.h>
+#include <linux/threads.h>
+
+#define saakm_assert(x)				\
+	do {						\
+		if (!(x))				\
+			panic("Error in " #x "\n");	\
+	} while (0)
+#define time_to_ticks(x) (ktime_to_ns(x) * HZ / 1000000000)
+#define ticks_to_time(x) (ns_to_ktime(x * 1000000000 / HZ))
+
+static char *name = KBUILD_MODNAME;
+static struct saakm_policy *policy;
+
+static const int max_quanta_ms = 100;
+static ktime_t max_quanta;
+
+struct cfs_ipa_sched_domain;
+
+struct cfs_ipa_process {
+	struct task_struct *task; // Internal
+	ktime_t vruntime;
+	ktime_t last_sched;
+	int load;
+};
+
+struct state_info {
+	struct cfs_ipa_process *current_0; /* private / unshared */
+	struct saakm_rq ready; /* public / shared */
+};
+DEFINE_PER_CPU_SHARED_ALIGNED(struct state_info, state_info);
+
+/* definition of core's states */
+static struct core_state_info {
+	cpumask_t active_cores;
+	cpumask_t idle_cores;
+} cstate_info;
+
+struct cfs_ipa_core {
+	enum saakm_core_state state; // Internal
+	cpumask_t *cpuset; // Internal
+	int id; // System
+	int cload;
+	ktime_t min_vruntime;
+	struct cfs_ipa_sched_domain *sd;
+};
+DEFINE_PER_CPU(struct cfs_ipa_core, core);
+
+struct cfs_ipa_sched_group {
+	cpumask_t cores;
+	int capacity;
+};
+
+/*
+ * Example of topology:
+ *
+ *    O----------[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]
+ *    |           /         |              |          \
+ *    O----[0 1 2 3]-----[4 5 6 7]----[8 9 10 11]-----[12 13 14 15]
+ *    |    /      \      /      \      /       \        /        \
+ *    O--[0 1]--[2 3]--[4 5]--[6 7]--[8 9]--[10 11]--[12 13]--[14 15]
+ *    |
+ *   cfs_ipa_topology
+ */
+struct cfs_ipa_sched_domain {
+	struct list_head siblings;  // link domains of the same level
+	struct cfs_ipa_sched_domain *parent;
+	int ___sched_group_idx; // Internal
+	struct cfs_ipa_sched_group *groups;
+	cpumask_t cores;
+	spinlock_t lock;
+	int flags; // Internal
+	ktime_t next_balance;
+	unsigned int count;
+};
+
+static struct list_head *cfs_ipa_topology;
+static unsigned int cfs_ipa_nr_topology_levels;
+
+
+static inline void update_thread(struct cfs_ipa_process *p)
+{
+	ktime_t now = ktime_get();
+	ktime_t delta = ktime_sub(now, p->last_sched);
+
+	p->vruntime = ktime_add(p->vruntime, delta);
+}
+
+/*
+ * Instant load:
+ *   q = now - last_sched = time since p was scheduled
+ *
+ *       iload = 1024 - (1024 * (max_quanta - q)) / max_quanta
+ *
+ * Load:
+ *   load(p) = 80% p->load + 20% iload
+ *           = (8 * p->load + 2 * iload) / 10
+ *
+ * We also check that 0 > p->load > 1024
+ */
+static inline void update_load(struct cfs_ipa_process *p)
+{
+	ktime_t now = ktime_get();
+	ktime_t q = ktime_sub(now, p->last_sched);
+	int load = 1024 - (1024 * (max_quanta - q)) / max_quanta;
+
+	p->load = (8 * p->load + 2 * load) / 10;
+	if (!p->load)
+		p->load = 1;
+}
+
+static int saakm_cfs_order_process(struct task_struct *a,
+			      struct task_struct *b)
+{
+	struct cfs_ipa_process *pa = policy_metadata(a);
+	struct cfs_ipa_process *pb = policy_metadata(b);
+
+	return pa->vruntime - pb->vruntime;
+}
+
+static void ipa_change_curr(struct cfs_ipa_core *c, struct cfs_ipa_process *p)
+{
+	BUG_ON(c->id != task_cpu(p->task));
+
+	saakm_state(c->id).current_0 = p;
+	change_state(p->task, SAAKM_RUNNING, c->id, NULL);
+}
+
+static void ipa_change_queue(struct cfs_ipa_process *p, struct saakm_rq *rq,
+			     enum saakm_state state, unsigned int cpu)
+{
+	struct cfs_ipa_core *c = &saakm_core(task_cpu(p->task));
+
+	BUG_ON(rq && rq->cpu != cpu);
+
+	if (saakm_state(c->id).current_0 == p)
+		saakm_state(c->id).current_0 = NULL;
+	change_state(p->task, state, cpu, rq);
+}
+
+static void set_active_core(struct cfs_ipa_core *core, cpumask_t *cores,
+			    int state)
+{
+	core->state = state;
+	if (core->cpuset)
+		cpumask_clear_cpu(core->id, core->cpuset);
+	cpumask_set_cpu(core->id, cores);
+	core->cpuset = cores;
+}
+
+static void set_sleeping_core(struct cfs_ipa_core *core, cpumask_t *cores,
+			      int state)
+{
+	core->state = state;
+	if (core->cpuset)
+		cpumask_clear_cpu(core->id, core->cpuset);
+	cpumask_set_cpu(core->id, cores);
+	core->cpuset = cores;
+}
+
+static enum saakm_core_state
+saakm_cfs_get_core_state(struct saakm_policy *policy, struct core_event *e)
+{
+	return saakm_core(e->target).state;
+}
+
+static int runnable(struct cfs_ipa_sched_group *sg)
+{
+	int cpu, nr_threads = 0;
+
+	if (!sg)
+		return 0;
+
+	for_each_cpu(cpu, &sg->cores) {
+		nr_threads += saakm_state(cpu).ready.nr_tasks;
+		nr_threads += saakm_state(cpu).current_0 ? 1 : 0;
+	}
+
+	return nr_threads;
+}
+
+static int grp_load(struct cfs_ipa_sched_group *sg)
+{
+	int cload = 0, cpu;
+
+	for_each_cpu(cpu, &sg->cores) {
+		cload += saakm_core(cpu).cload;
+	}
+
+	return cload;
+}
+
+struct lb_env {
+	int busiest_grp_cload;
+	int thief_grp_cload;
+	int busiest_grp_runnable;
+	int thief_grp_runnable;
+};
+
+static int migrate_from_to(struct cfs_ipa_core *busiest,
+			   struct cfs_ipa_sched_group *busiest_grp,
+			   struct cfs_ipa_core *self_38,
+			   struct cfs_ipa_sched_group *thief_grp,
+			   struct lb_env *env)
+{
+	struct task_struct *pos, *n;
+	LIST_HEAD(tasks);
+	struct sched_saakm_entity *imd;
+	struct cfs_ipa_process *t;
+	int dbg_cpt = 0, ret, self_cload;
+	unsigned long flags;
+
+	/* Remove tasks from busiest */
+	local_irq_save(flags);
+	saakm_lock_core(busiest->id);
+
+	self_cload = self_38->cload;
+	rbtree_postorder_for_each_entry_safe(pos, n,
+					     &saakm_state(busiest->id).ready.root,
+					     saakm.node_runqueue) {
+		t = policy_metadata(pos);
+		if (pos->on_cpu)
+			continue;
+
+		if (!cpumask_test_cpu(self_38->id, pos->cpus_ptr))
+			continue;
+
+		if (env->busiest_grp_runnable > cpumask_weight(&busiest_grp->cores) &&
+		    (env->thief_grp_runnable < cpumask_weight(&thief_grp->cores) ||
+		     env->busiest_grp_cload - env->thief_grp_cload >= t->load)) {
+			list_add(&pos->saakm.ipa_tasks, &tasks);
+			t->vruntime -= busiest->min_vruntime;
+			ipa_change_queue(t, NULL, SAAKM_MIGRATING,
+					 self_38->id);
+			dbg_cpt = dbg_cpt + 1;
+			busiest->cload = busiest->cload - t->load;
+			self_cload = self_cload + t->load;
+			env->busiest_grp_cload -= t->load;
+			env->busiest_grp_runnable--;
+			env->thief_grp_cload += t->load;
+			env->thief_grp_runnable++;
+		}
+		/* Ensure migration cond. and stop cond. use the same ids ! */
+		if (env->busiest_grp_cload <= env->thief_grp_cload ||
+		    env->busiest_grp_runnable <= cpumask_weight(&busiest_grp->cores))
+			break;
+	}
+	saakm_unlock_core(busiest->id);
+	ret = dbg_cpt;
+
+	/* Add them to my queue */
+	saakm_lock_core(self_38->id);
+	while (!list_empty(&tasks)) {
+		imd = list_first_entry(&tasks, struct sched_saakm_entity,
+				       ipa_tasks);
+		pos = container_of(imd, struct task_struct, saakm);
+		t = policy_metadata(pos);
+		t->vruntime += self_38->min_vruntime;
+		ipa_change_queue(t, &saakm_state(self_38->id).ready,
+				 SAAKM_READY, self_38->id);
+		self_38->cload = self_38->cload + t->load;
+		list_del_init(&imd->ipa_tasks);
+		dbg_cpt--;
+
+	}
+	/* self_38->load = self_38->load + (my_load - m_load_tmp); */
+	saakm_unlock_core(self_38->id);
+	local_irq_restore(flags);
+
+	if (dbg_cpt != 0)
+		pr_info("Some tasks (%d) were lost on a migration from %d to %d\n",
+			       dbg_cpt, busiest->id, self_38->id);
+
+	return ret;
+}
+
+static struct cfs_ipa_sched_group *
+find_busiest_group(struct saakm_policy *policy,
+		   struct cfs_ipa_sched_domain *sd,
+		   unsigned long *stealable_groups)
+{
+	struct cfs_ipa_sched_group *sg = sd->groups, *busiest = NULL;
+	unsigned int max_avg_load = 0, avg_load;
+	int cpu, i, nr_cpus;
+
+	/* for each group, compute average load, and find max */
+	for (i = 0; i < sd->___sched_group_idx; sg++, i++) {
+		if (!test_bit(i, stealable_groups))
+			continue;
+		avg_load = 0;
+		nr_cpus = 0;
+		for_each_cpu(cpu, &sg->cores) {
+			avg_load += (&saakm_core(cpu))->cload;
+			nr_cpus++;
+		}
+		avg_load = avg_load / nr_cpus;
+		if (avg_load > max_avg_load) {
+			max_avg_load = avg_load;
+			busiest = sg;
+		}
+	}
+
+	return busiest;
+}
+
+static struct cfs_ipa_core *
+find_busiest_cpu_group(struct saakm_policy *policy,
+		       struct cfs_ipa_sched_group *sg,
+		       cpumask_t *stealable_cores)
+{
+	int cpu;
+	unsigned int max_load = 0;
+	struct cfs_ipa_core *c = NULL, *busiest = NULL;
+
+	for_each_cpu_and(cpu, &sg->cores, stealable_cores) {
+		c = &saakm_core(cpu);
+		if (c->cload > max_load) {
+			max_load = c->cload;
+			busiest = c;
+		}
+	}
+
+	return busiest;
+}
+
+static bool can_steal_group(struct saakm_policy *policy,
+			    struct cfs_ipa_sched_group *tgt,
+			    struct cfs_ipa_sched_group *thief)
+{
+	int cpu, nr_threads = 0, nr_cores = 0;
+
+	for_each_cpu(cpu, &tgt->cores) {
+		nr_threads += saakm_state(cpu).ready.nr_tasks;
+		nr_threads += saakm_state(cpu).current_0 ? 1 : 0;
+		nr_cores++;
+	}
+
+	return nr_threads > nr_cores;
+}
+
+static struct cfs_ipa_sched_group *select_group(struct saakm_policy *policy,
+						struct cfs_ipa_sched_domain *sd,
+						unsigned long *stealable_groups)
+{
+	return find_busiest_group(policy, sd, stealable_groups);
+}
+
+static bool can_steal_core(struct cfs_ipa_core *tgt, struct cfs_ipa_core *thief)
+{
+	int nr_threads = 0;
+
+	nr_threads += saakm_state(tgt->id).ready.nr_tasks;
+	nr_threads += saakm_state(tgt->id).current_0 ? 1 : 0;
+
+	return nr_threads > 1;
+}
+
+static struct cfs_ipa_core *select_core(struct saakm_policy *policy,
+					struct cfs_ipa_sched_group *sg,
+					cpumask_t *stealable_cores)
+{
+	return find_busiest_cpu_group(policy, sg, stealable_cores);
+}
+
+DEFINE_SPINLOCK(lb_lock);
+
+static void steal_for_dom(struct saakm_policy *policy,
+			  struct cfs_ipa_core *core_31,
+			  struct cfs_ipa_sched_domain *sd)
+{
+	struct lb_env env;
+	unsigned long *stealable_groups = kcalloc(BITS_TO_LONGS(sd->___sched_group_idx),
+                           sizeof(unsigned long),
+                           GFP_KERNEL);
+	// DECLARE_BITMAP(stealable_groups, sd->___sched_group_idx);
+	cpumask_t stealable_cores;
+	struct cfs_ipa_core *selected = NULL, *c = NULL;
+	struct cfs_ipa_sched_group
+		*sg = NULL,
+		*thief_group = NULL,
+		*target_group = NULL;
+	int i;
+
+	/* init bitmaps */
+	bitmap_zero(stealable_groups, sd->___sched_group_idx);
+	cpumask_clear(&stealable_cores);
+
+	/* find group containing core_31 */
+	for (i = 0; i < sd->___sched_group_idx; i++) {
+		sg = sd->groups + i;
+		if (cpumask_test_cpu(core_31->id, &sg->cores)) {
+			thief_group = sg;
+			break;
+		}
+	}
+
+	env.thief_grp_cload = grp_load(thief_group);
+	env.thief_grp_runnable = runnable(thief_group);
+
+	/* Step 1: can_steal_group() */
+	for (i = 0; i < sd->___sched_group_idx; i++) {
+		sg = sd->groups + i;
+		if (sg == thief_group)
+			continue;
+		if (can_steal_group(policy, sg, thief_group))
+			bitmap_set(stealable_groups, i, 1);
+	}
+	if (bitmap_empty(stealable_groups, sd->___sched_group_idx))
+		goto forward_next_balance;
+
+	/* Step 2: select_group() */
+	target_group = select_group(policy, sd, stealable_groups);
+	if (!target_group)
+		goto forward_next_balance;
+	env.busiest_grp_cload = grp_load(target_group);
+	env.busiest_grp_runnable = runnable(target_group);
+
+	/* Step 3: can_steal_core() */
+	for_each_cpu(i, &target_group->cores) {
+		c = &saakm_core(i);
+		if (c == core_31)
+			continue;
+		if (can_steal_core(c, core_31))
+			cpumask_set_cpu(i, &stealable_cores);
+	}
+	if (cpumask_empty(&stealable_cores))
+		goto forward_next_balance;
+
+	/* Step 4: select_core() */
+	selected = select_core(policy, target_group,
+			       &stealable_cores);
+	if (!selected)
+		goto forward_next_balance;
+
+	/* Step 5: steal_thread() */
+	migrate_from_to(selected, target_group,
+			core_31, thief_group,
+			&env);
+
+forward_next_balance:
+	spin_lock(&sd->lock);
+	sd->count++;
+	sd->next_balance = ktime_add(ktime_get(),
+				     ms_to_ktime(cpumask_weight(&sd->cores)));
+	spin_unlock(&sd->lock);
+
+}
+
+static struct cfs_ipa_core *
+find_idlest_cpu_group(struct saakm_policy *policy,
+		      struct cfs_ipa_sched_group *sg)
+{
+	int cpu;
+	unsigned int min_load = UINT_MAX;
+	struct cfs_ipa_core *c = NULL, *idlest = NULL;
+
+	if (unlikely(!sg))
+		return NULL;
+
+	for_each_cpu(cpu, &sg->cores) {
+		c = &saakm_core(cpu);
+		/* if cpu is idle, choose it immediately */
+		if (cpumask_test_cpu(cpu, &cstate_info.idle_cores)) {
+			idlest = c;
+			goto end;
+		}
+		/* else, continue to search for idlest cpu */
+		if (c->cload < min_load) {
+			idlest = c;
+			min_load = c->cload;
+		}
+	}
+
+end:
+	return idlest;
+}
+
+static struct cfs_ipa_sched_group *
+find_idlest_group(struct saakm_policy *policy,
+		  struct cfs_ipa_sched_domain *sd)
+{
+	struct cfs_ipa_sched_group *sg = sd->groups, *idlest = NULL;
+	int i, cpu, nr_cpus;
+	unsigned int min_avg_load = UINT_MAX;
+	unsigned int avg_load;
+
+	if (unlikely(!sd))
+		return NULL;
+
+	/* for each group, compute average load, and find min */
+	for (i = 0; i < sd->___sched_group_idx; sg++, i++) {
+		avg_load = 0;
+		nr_cpus = 0;
+		for_each_cpu(cpu, &sg->cores) {
+			avg_load += (&saakm_core(cpu))->cload;
+			nr_cpus++;
+		}
+		avg_load = avg_load / nr_cpus;
+		if (avg_load < min_avg_load) {
+			min_avg_load = avg_load;
+			idlest = sg;
+		}
+	}
+
+	return idlest;
+}
+
+static int saakm_cfs_new_prepare(struct saakm_policy *policy,
+				   struct process_event *e)
+{
+	struct cfs_ipa_process *tgt;
+	struct cfs_ipa_sched_domain *sd;
+	struct cfs_ipa_sched_group *sg;
+	struct cfs_ipa_core *c, *idlest = NULL;
+	struct task_struct *task_15;
+
+	task_15 = e->target;
+	tgt = kzalloc(sizeof(struct cfs_ipa_process), GFP_ATOMIC);
+	if (!tgt)
+		return -1;
+
+	policy_metadata(task_15) = tgt;
+	tgt->task = task_15;
+
+	/*
+	 * find idlest group in highest domain, then idlest core in this group
+	 */
+	c = &saakm_core(task_cpu(task_15));
+	sd = c->sd;
+	while (sd) {
+		if (!sd->parent)
+			break;
+		sd = sd->parent;
+	}
+	sg = find_idlest_group(policy, sd);
+	idlest = find_idlest_cpu_group(policy, sg);
+
+	/* if thread cannot be on this cpu, choose any good cpu */
+	if (!cpumask_test_cpu(idlest->id, task_15->cpus_ptr))
+		idlest = &saakm_core(cpumask_any(task_15->cpus_ptr));
+
+	tgt->vruntime = idlest->min_vruntime;
+	tgt->load = 1024;
+
+	return idlest->id;
+}
+
+static void saakm_cfs_new_place(struct saakm_policy *policy,
+				  struct process_event *e)
+{
+	struct cfs_ipa_process *tgt = policy_metadata(e->target);
+	int idlecore_10 = task_cpu(e->target);
+	struct cfs_ipa_core *c = &saakm_core(idlecore_10);
+
+	c->cload += tgt->load;
+	/* Memory barrier for proofs */
+	smp_wmb();
+	ipa_change_queue(tgt, &saakm_state(task_cpu(tgt->task)).ready,
+			 SAAKM_READY, task_cpu(tgt->task));
+}
+
+static void saakm_cfs_new_end(struct saakm_policy *policy,
+				struct process_event *e)
+{
+	pr_info("[%d] post new on core %d\n", e->target->pid, task_cpu(e->target));
+}
+
+static void saakm_cfs_detach(struct saakm_policy *policy,
+			       struct process_event *e)
+/* need to free the process metadata memory */
+{
+	struct cfs_ipa_process *tgt = policy_metadata(e->target);
+	struct cfs_ipa_core *c = &saakm_core(task_cpu(tgt->task));
+
+	ipa_change_queue(tgt, NULL, SAAKM_TERMINATED, task_cpu(tgt->task));
+	/* Memory barrier for proofs */
+	smp_wmb();
+	c->cload -= tgt->load;
+	kfree(tgt);
+}
+
+static void saakm_cfs_tick(struct saakm_policy *policy,
+			     struct process_event *e)
+{
+	struct cfs_ipa_process *tgt = policy_metadata(e->target);
+	struct cfs_ipa_core *c = &saakm_core(task_cpu(e->target));
+	ktime_t now = ktime_get();
+	ktime_t curr_runtime = ktime_sub(now, tgt->last_sched);
+	int old_load = tgt->load;
+
+	if (ktime_after(curr_runtime, max_quanta)) {
+		update_thread(tgt);
+		update_load(tgt);
+		ipa_change_queue(tgt,
+				 &saakm_state(task_cpu(tgt->task)).ready,
+				 SAAKM_READY_TICK, task_cpu(tgt->task));
+		/* Memory barrier for proofs */
+		smp_wmb();
+		c->cload += (tgt->load - old_load);
+	}
+}
+
+static void saakm_cfs_yield(struct saakm_policy *policy,
+			      struct process_event *e)
+{
+	struct cfs_ipa_process *tgt = policy_metadata(e->target);
+	struct cfs_ipa_core *c = &saakm_core(task_cpu(e->target));
+	int old_load = tgt->load;
+
+	update_thread(tgt);
+	update_load(tgt);
+	ipa_change_queue(tgt, &saakm_state(task_cpu(tgt->task)).ready,
+			 SAAKM_READY, task_cpu(tgt->task));
+	/* Memory barrier for proofs */
+	smp_wmb();
+	c->cload += (tgt->load - old_load);
+}
+
+static void saakm_cfs_block(struct saakm_policy *policy,
+			      struct process_event *e)
+{
+	struct cfs_ipa_process *tgt = policy_metadata(e->target);
+	struct cfs_ipa_core *c = &saakm_core(task_cpu(e->target));
+	int old_load = tgt->load;
+
+	update_thread((struct cfs_ipa_process *)tgt);
+	update_load((struct cfs_ipa_process *)tgt);
+	ipa_change_queue(tgt, NULL, SAAKM_BLOCKED, task_cpu(tgt->task));
+	/* Memory barrier for proofs */
+	smp_wmb();
+	c->cload -= old_load;
+}
+
+static struct cfs_ipa_core *find_idle_cpu(struct saakm_policy *policy,
+					  struct cfs_ipa_sched_domain *sd)
+{
+	int cpu;
+
+	for_each_cpu(cpu, &sd->cores) {
+		if (cpumask_test_cpu(cpu, &cstate_info.idle_cores))
+			return &saakm_core(cpu);
+	}
+
+	return NULL;
+}
+
+static int saakm_cfs_unblock_prepare(struct saakm_policy *policy,
+				       struct process_event *e)
+{
+	struct task_struct *task_15 = e->target;
+	struct cfs_ipa_process *p = policy_metadata(task_15);
+	struct cfs_ipa_sched_domain *sd = NULL, *highest = NULL;
+	struct cfs_ipa_sched_group *sg = NULL;
+	struct cfs_ipa_core *c, *idlest = NULL;
+	int flags = 0;
+
+	/* remove min_vruntime from previous cpu */
+	c = &saakm_core(task_cpu(task_15));
+	p->vruntime -= c->min_vruntime;
+
+	/* if c is idle, choose it */
+	if (cpumask_test_cpu(c->id, &cstate_info.idle_cores)) {
+		idlest = c;
+		goto end;
+	}
+
+	/* domains where fork placement is allowed */
+	flags |= DOMAIN_SMT | DOMAIN_CACHE;
+
+	/* Search for the closest idle core sharing cache */
+	sd = c->sd;
+	while (sd) {
+		if (sd->flags & flags) {
+			highest = sd;
+			idlest = find_idle_cpu(policy, sd);
+			if (idlest)
+				goto end;
+		}
+		sd = sd->parent;
+	}
+
+	/*
+	 * no core sharing cache is idle, use idlest core in highest domain
+	 * sharing cache
+	 */
+	sg = find_idlest_group(policy, highest);
+	idlest = find_idlest_cpu_group(policy, sg);
+
+	/* if no core found, wake up on previous core */
+	if (!idlest)
+		idlest = c;
+
+end:
+	/* if thread cannot be on this cpu, choose any good cpu */
+	if (!cpumask_test_cpu(idlest->id, task_15->cpus_ptr))
+		idlest = &saakm_core(cpumask_any(task_15->cpus_ptr));
+
+	/* add min_vruntime from new cpu */
+	p->vruntime += idlest->min_vruntime;
+
+	return idlest->id;
+}
+
+static void saakm_cfs_unblock_place(struct saakm_policy *policy,
+				      struct process_event *e)
+{
+	struct cfs_ipa_process *tgt = policy_metadata(e->target);
+	int idlecore_11 = task_cpu(e->target);
+	struct cfs_ipa_core *c = &saakm_core(idlecore_11);
+
+	c->cload += tgt->load;
+	/* Memory barrier for proofs */
+	smp_wmb();
+	ipa_change_queue(tgt, &saakm_state(idlecore_11).ready,
+			 SAAKM_READY, task_cpu(tgt->task));
+}
+
+static void saakm_cfs_unblock_end(struct saakm_policy *policy,
+				    struct process_event *e)
+{
+	pr_info("[%d] post unblock on core %d\n", e->target->pid,
+		       task_cpu(e->target));
+}
+
+static void saakm_cfs_schedule(struct saakm_policy *policy,
+				 unsigned int cpu)
+{
+	struct task_struct *task_20 = NULL;
+	struct cfs_ipa_process *p;
+	struct cfs_ipa_core *c = &saakm_core(cpu);
+
+	task_20 = saakm_first_task(&saakm_state(cpu).ready);
+	if (!task_20)
+		return;
+
+	p = policy_metadata(task_20);
+	p->last_sched = ktime_get();
+	c->min_vruntime = p->vruntime;
+
+	ipa_change_curr(c, p);
+}
+
+static void saakm_cfs_core_entry(struct saakm_policy *policy,
+				   struct core_event *e)
+{
+	struct cfs_ipa_core *tgt = &per_cpu(core, e->target);
+
+	set_active_core(tgt, &cstate_info.active_cores, SAAKM_ACTIVE_CORE);
+}
+
+static void saakm_cfs_core_exit(struct saakm_policy *policy,
+				  struct core_event *e)
+{
+	struct cfs_ipa_core *tgt = &per_cpu(core, e->target);
+
+	tgt->min_vruntime = 0;
+	set_sleeping_core(tgt, &cstate_info.idle_cores, SAAKM_IDLE_CORE);
+}
+
+static void saakm_cfs_newly_idle(struct saakm_policy *policy,
+				   struct core_event *e)
+{
+	struct cfs_ipa_core *c = &per_cpu(core, e->target);
+	struct cfs_ipa_sched_domain *sd = c->sd;
+
+	while (sd) {
+		steal_for_dom(policy, c, sd);
+		if (saakm_state(c->id).ready.nr_tasks)
+			break;
+		sd = sd->parent;
+	}
+}
+
+static void saakm_cfs_enter_idle(struct saakm_policy *policy,
+				   struct core_event *e)
+{
+	struct cfs_ipa_core *tgt = &per_cpu(core, e->target);
+
+	set_sleeping_core(tgt, &cstate_info.idle_cores, SAAKM_IDLE_CORE);
+}
+
+static void saakm_cfs_exit_idle(struct saakm_policy *policy,
+				  struct core_event *e)
+{
+	struct cfs_ipa_core *tgt = &per_cpu(core, e->target);
+
+	set_active_core(tgt, &cstate_info.active_cores, SAAKM_ACTIVE_CORE);
+}
+
+static void saakm_cfs_balancing(struct saakm_policy *policy,
+				  struct core_event *e)
+{
+	struct cfs_ipa_core *c = &per_cpu(core, e->target);
+	struct cfs_ipa_sched_domain *sd;
+	ktime_t now = ktime_get();
+
+	sd = c->sd;
+	while (sd) {
+		if (ktime_before(sd->next_balance, now))
+			steal_for_dom(policy, c, sd);
+		sd = sd->parent;
+	}
+}
+
+static int saakm_cfs_init(struct saakm_policy *policy)
+{
+	return 0;
+}
+
+static bool saakm_cfs_attach(struct saakm_policy *policy,
+			       struct task_struct *_fresh_14, char *command)
+{
+	return true;
+}
+
+static int saakm_cfs_free_metadata(struct saakm_policy *policy)
+{
+	kfree(policy->data);
+	return 0;
+}
+
+static int saakm_cfs_can_be_default(struct saakm_policy *policy)
+{
+	return 1;
+}
+
+struct saakm_module_routines saakm_cfs_routines = {
+	.get_core_state = saakm_cfs_get_core_state,
+	.new_prepare = saakm_cfs_new_prepare,
+	.new_place = saakm_cfs_new_place,
+	.new_end = saakm_cfs_new_end,
+	.tick    = saakm_cfs_tick,
+	.yield   = saakm_cfs_yield,
+	.block   = saakm_cfs_block,
+	.unblock_prepare = saakm_cfs_unblock_prepare,
+	.unblock_place = saakm_cfs_unblock_place,
+	.unblock_end = saakm_cfs_unblock_end,
+	.terminate = saakm_cfs_detach,
+	.schedule = saakm_cfs_schedule,
+	.newly_idle = saakm_cfs_newly_idle,
+	.enter_idle = saakm_cfs_enter_idle,
+	.exit_idle = saakm_cfs_exit_idle,
+	.balancing_select = saakm_cfs_balancing,
+	.core_entry = saakm_cfs_core_entry,
+	.core_exit = saakm_cfs_core_exit,
+	.init    = saakm_cfs_init,
+	.free_metadata = saakm_cfs_free_metadata,
+	.can_be_default	= saakm_cfs_can_be_default,
+	.attach  = saakm_cfs_attach
+};
+
+static int init_topology(void)
+{
+	struct topology_level *t = per_cpu(topology_levels, 0);
+	size_t size;
+	int i;
+
+	cfs_ipa_nr_topology_levels = 0;
+
+	while (t) {
+		cfs_ipa_nr_topology_levels++;
+		t = t->next;
+	}
+
+	size = cfs_ipa_nr_topology_levels * sizeof(struct list_head);
+	cfs_ipa_topology = kzalloc(size, GFP_KERNEL);
+	if (!cfs_ipa_topology) {
+		cfs_ipa_nr_topology_levels = 0;
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < cfs_ipa_nr_topology_levels; i++)
+		INIT_LIST_HEAD(cfs_ipa_topology + i);
+
+	return 0;
+}
+
+static void destroy_scheduling_domains(void)
+{
+	struct cfs_ipa_sched_domain *sd, *tmp;
+	int i;
+
+	for (i = 0; i < cfs_ipa_nr_topology_levels; i++) {
+		list_for_each_entry_safe(sd, tmp, cfs_ipa_topology + i,
+					 siblings) {
+			list_del(&sd->siblings);
+			kfree(sd->groups);
+			kfree(sd);
+		}
+	}
+
+	kfree(cfs_ipa_topology);
+}
+
+static int create_scheduling_domains(unsigned int cpu)
+{
+	struct topology_level *t = per_cpu(topology_levels, cpu);
+	struct cfs_ipa_core *c = &saakm_core(cpu);
+	size_t sd_size = sizeof(struct cfs_ipa_sched_domain);
+	unsigned int level = 0;
+	struct cfs_ipa_sched_domain *sd, *lower_sd = NULL;
+	bool seen;
+
+	c->sd = NULL;
+
+	while (t) {
+		/* if cpu is present in current level */
+		seen = false;
+		list_for_each_entry(sd, cfs_ipa_topology + level, siblings) {
+			if (cpumask_test_cpu(cpu, &sd->cores)) {
+				seen = true;
+				break;
+			}
+		}
+		if (!seen) {
+			sd = kzalloc(sd_size, GFP_KERNEL);
+			if (!sd)
+				goto err;
+			INIT_LIST_HEAD(&sd->siblings);
+			sd->parent = NULL;
+			sd->___sched_group_idx = 0;
+			sd->groups = NULL;
+			cpumask_copy(&sd->cores, &t->cores);
+			sd->flags = t->flags;
+			sd->next_balance = 0;
+			sd->count = 0;
+			spin_lock_init(&sd->lock);
+			list_add_tail(&sd->siblings, cfs_ipa_topology + level);
+		}
+		if (lower_sd)
+			lower_sd->parent = sd;
+		else
+			c->sd = sd;
+
+		if (seen)
+			break;
+
+		lower_sd = sd;
+		t = t->next;
+		level++;
+	}
+
+	return 0;
+
+err:
+	destroy_scheduling_domains();
+	return -ENOMEM;
+}
+
+static int build_groups(struct cfs_ipa_sched_domain *sd,
+			unsigned int lvl)
+{
+	struct cfs_ipa_sched_domain *sdl;
+	struct cfs_ipa_sched_group *sg = NULL;
+	int n = 0;
+
+	list_for_each_entry(sdl, &cfs_ipa_topology[lvl - 1], siblings) {
+		if (cpumask_subset(&sdl->cores, &sd->cores)) {
+			n++;
+			sg = krealloc(sg,
+				      n * sizeof(struct cfs_ipa_sched_group),
+				      GFP_KERNEL);
+			if (!sg)
+				goto err;
+
+			cpumask_copy(&sg[n - 1].cores, &sdl->cores);
+		}
+	}
+
+	sd->___sched_group_idx = n;
+	sd->groups = sg;
+
+	return 0;
+
+err:
+	destroy_scheduling_domains();
+	return -ENOMEM;
+}
+
+static int build_lower_groups(struct cfs_ipa_sched_domain *sd)
+{
+	int cpu, n, i = 0;
+
+	n = cpumask_weight(&sd->cores);
+	sd->groups = kcalloc(n, sizeof(struct cfs_ipa_sched_group),
+			     GFP_KERNEL);
+	if (!sd->groups)
+		goto fail;
+	sd->___sched_group_idx = n;
+
+	for_each_cpu(cpu, &sd->cores) {
+		cpumask_clear(&sd->groups[i].cores);
+		cpumask_set_cpu(cpu, &sd->groups[i].cores);
+		i++;
+	}
+
+	return 0;
+
+fail:
+	destroy_scheduling_domains();
+	return -ENOMEM;
+}
+
+/* Scheduling domains must be up to date for all CPUs */
+static int create_scheduling_groups(void)
+{
+	struct cfs_ipa_sched_domain *sd = NULL;
+	int i, ret;
+
+	for (i = cfs_ipa_nr_topology_levels - 1; i > 0; i--) {
+		list_for_each_entry(sd, &cfs_ipa_topology[i], siblings) {
+			ret = build_groups(sd, i);
+			if (ret)
+				goto fail;
+		}
+	}
+
+	list_for_each_entry(sd, cfs_ipa_topology, siblings) {
+		ret = build_lower_groups(sd);
+		if (ret)
+			goto fail;
+	}
+
+	return 0;
+
+fail:
+	destroy_scheduling_domains();
+	return -ENOMEM;
+}
+
+static void build_hierarchy(void)
+{
+	int cpu;
+
+	init_topology();
+
+	/* if unicore, don't build hierarchy */
+	if (!cfs_ipa_nr_topology_levels)
+		return;
+
+	/* create hierarchy for all cpus */
+	for_each_possible_cpu(cpu) {
+		create_scheduling_domains(cpu);
+	}
+	create_scheduling_groups();
+}
+
+static int proc_show(struct seq_file *s, void *p)
+{
+	long cpu = (long) s->private;
+	struct task_struct *pos, *n;
+	struct cfs_ipa_process *pr, *curr_proc;
+	struct cfs_ipa_sched_domain *sd = saakm_core(cpu).sd;
+	int load_sum = 0, i;
+
+	saakm_lock_core(cpu);
+	pr = saakm_state(cpu).current_0;
+	seq_printf(s, "CPU: %ld\n", cpu);
+	seq_printf(s, "RUNNING (policy): %d (%d)\n",
+		   pr ? pr->task->pid : -1,
+		   pr ? pr->load : -1);
+	n = get_saakm_current(cpu);
+	seq_printf(s, "RUNNING (runtime): %d\n", n ? n->pid : -1);
+	load_sum += pr ? pr->load : 0;
+	seq_puts(s, "READY: ");
+	rbtree_postorder_for_each_entry_safe(pos, n,
+					     &(saakm_state(cpu).ready).root,
+					     saakm.node_runqueue) {
+		curr_proc = (struct cfs_ipa_process *)policy_metadata(pos);
+		load_sum += curr_proc->load;
+		seq_printf(s, "%d (%d) -> ", pos->pid, curr_proc->load);
+	}
+
+	seq_puts(s, "\n");
+	seq_printf(s, "COUNT(READY) = %d\n", count(SAAKM_READY, cpu));
+	seq_printf(s, "load = %d\n", saakm_core(cpu).cload);
+	seq_printf(s, "load_sum = %d\n", load_sum);
+
+	seq_puts(s, "\nTopology:\n");
+	while (sd) {
+		seq_printf(s, "[%*pbl]: ", cpumask_pr_args(&sd->cores));
+		for (i = 0; i < sd->___sched_group_idx; i++)
+			seq_printf(s, "{%*pbl}",
+				   cpumask_pr_args(&sd->groups[i].cores));
+		seq_puts(s, "\n");
+		sd = sd->parent;
+	}
+
+	saakm_unlock_core(cpu);
+
+	return 0;
+}
+
+static int proc_open(struct inode *inode, struct file *file)
+{
+	long cpu;
+
+	if (!kstrtol(file->f_path.dentry->d_iname, 10, &cpu))
+		return single_open(file, proc_show, (void *)cpu);
+	return -ENOENT;
+}
+
+static const struct proc_ops proc_fops = {
+	.proc_open    = proc_open,
+	.proc_read    = seq_read,
+	.proc_lseek  = seq_lseek,
+	.proc_release = single_release
+};
+
+static int proc_topo_show(struct seq_file *s, void *p)
+{
+	int i;
+	struct cfs_ipa_sched_domain *sd;
+
+	for (i = 0; i < cfs_ipa_nr_topology_levels; i++) {
+		seq_printf(s, "Level %d: ", i);
+		list_for_each_entry(sd, cfs_ipa_topology + i, siblings) {
+			seq_printf(s, "[%*pbl]", cpumask_pr_args(&sd->cores));
+		}
+		seq_puts(s, "\n");
+	}
+
+	return 0;
+}
+
+static int proc_topo_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, proc_topo_show, NULL);
+}
+
+static const struct proc_ops proc_topo_fops = {
+	.proc_open    = proc_topo_open,
+	.proc_read    = seq_read,
+	.proc_lseek  = seq_lseek,
+	.proc_release = single_release,
+};
+
+static int __init my_init_module(void)
+{
+	int res, cpu;
+	struct proc_dir_entry *procdir = NULL;
+	char procbuf[10];
+
+	max_quanta = ms_to_ktime(max_quanta_ms);
+
+	/* Initialize scheduler variables with non-const value */
+	for_each_possible_cpu(cpu) {
+		saakm_core(cpu).id = cpu;
+		saakm_core(cpu).cpuset = &cstate_info.idle_cores;
+		/* FIXME init of core variables of the user */
+		saakm_core(cpu).cload = 0;
+		/* allocation of saakm rqs */
+		init_saakm_rq(&saakm_state(cpu).ready, RBTREE, cpu,
+				SAAKM_READY, saakm_cfs_order_process);
+	}
+
+	/* build hierarchy with topology */
+	build_hierarchy();
+
+	/* Allocate & setup the saakm_policy */
+	policy = kzalloc(sizeof(struct saakm_policy), GFP_KERNEL);
+	if (!policy) {
+		res = -ENOMEM;
+		goto end;
+	}
+	strncpy(policy->name, name, MAX_POLICY_NAME_LEN);
+	policy->routines = &saakm_cfs_routines;
+	policy->kmodule = THIS_MODULE;
+
+	/* Register module to the runtime */
+	res = saakm_add_policy(policy);
+	if (res)
+		goto clean_policy;
+
+	/*
+	 * Create /proc/saakm/cfs hierarchy.
+	 * If file creation fails, module insertion does not
+	 */
+	procdir = proc_mkdir(name, ipa_procdir);
+	if (!procdir)
+		pr_err("/proc/saakm/%s creation failed\n", name);
+	for_each_possible_cpu(cpu) {
+		scnprintf(procbuf, 10, "%d", cpu);
+		if (!proc_create(procbuf, 0444, procdir, &proc_fops))
+			pr_err("/proc/saakm/%s/%s creation failed\n",
+			       name, procbuf);
+	}
+	if (!proc_create("topology", 0444, procdir, &proc_topo_fops))
+		pr_err("/proc/saakm/%s/topology creation failed\n",
+		       name);
+
+	return 0;
+
+clean_policy:
+	kfree(policy);
+end:
+	return res;
+}
+
+static void __exit my_cleanup_module(void)
+{
+	int res;
+
+	remove_proc_subtree(name, ipa_procdir);
+
+	res = saakm_remove_policy(policy);
+	if (res) {
+		pr_err("Cleanup failed (%d)\n", res);
+		return;
+	}
+
+	destroy_scheduling_domains();
+	kfree(policy);
+}
+
+module_init(my_init_module);
+module_exit(my_cleanup_module);
+
+MODULE_AUTHOR("RedhaCC");
+MODULE_DESCRIPTION(KBUILD_MODNAME" scheduling policy");
+MODULE_LICENSE("GPL");
