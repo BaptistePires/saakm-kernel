@@ -16,3 +16,5 @@ several of them using the reStructuredText markup notation.
 Please read the Documentation/process/changes.rst file, as it contains the
 requirements for building and running the kernel, and information about
 the problems which may result by upgrading your kernel.
+
+This work was carried out as part of Baptiste Pires' PhD thesis at the LIP6 in the Delys team. The thesis director is Pierre Sens, and the supervisors are : Swan Dubois, Redha Gouicem and Julien Sopena. This thesis is part of the BPI Project - FogSLA‑Antillas project (DOS0168403/00‑DOS0168405/00).
