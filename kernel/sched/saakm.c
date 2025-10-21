@@ -449,16 +449,18 @@ static int saakm_balancing_select(void)
 	unsigned int core = smp_processor_id();
 	struct saakm_policy *policy;
 	struct core_event e = { .target = core };
-	unsigned long flags;
+	// struct rq_flags rf;
 	int ret = 0;
 
-	read_lock_irqsave(&saakm_rwlock, flags);
+	// rq_unpin_lock(cpu_rq(core), &rf);
+	// TODO : temp fix to see if it works..
+	// read_lock_irqsave(&saakm_rwlock, flags);
 	list_for_each_entry(policy, &saakm_policies, list) {
 		if (policy->routines->balancing_select)
 			ret = policy->routines->balancing_select(policy, &e);
 	}
-	read_unlock_irqrestore(&saakm_rwlock, flags);
-	
+	// read_unlock_irqrestore(&saakm_rwlock, flags);
+	// rq_repin_lock(cpu_rq(core), &rf);
 	return ret;
 }
 
@@ -1320,10 +1322,17 @@ static void put_prev_task_saakm(struct rq *rq,
 static int balance_saakm(struct rq *rq, struct task_struct *prev,
 			   struct rq_flags *rf)
 {
-	if (rq->nr_running)
+	int ret;
+	if (rq->nr_running || !saakm_enabled())
 		return 1;
 	
-	return saakm_balancing_select();
+	rq_unpin_lock(rq, rf);
+	raw_spin_rq_unlock(rq);
+	ret = saakm_balancing_select();
+	raw_spin_rq_lock(rq);
+	rq_repin_lock(rq, rf);
+
+	return ret;
 }
 
 static int select_task_rq_saakm(struct task_struct *p,
