@@ -873,10 +873,7 @@ static bool dequeue_task_saakm(struct rq *rq,
 				 int flags)
 {
 	unsigned int state;
-	struct process_event e = { .target = p, .cpu = smp_processor_id() };
-
-	if (p->se.sched_delayed)
-		pr_info("wtf delayed");
+	struct process_event e = { .target = p, .cpu = smp_processor_id(), .flags = flags};
 
 
 	if (unlikely(saakm_sched_class_log))
