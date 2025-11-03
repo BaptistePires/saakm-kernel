@@ -456,8 +456,11 @@ static int saakm_balancing_select(void)
 	// TODO : temp fix to see if it works..
 	// read_lock_irqsave(&saakm_rwlock, flags);
 	list_for_each_entry(policy, &saakm_policies, list) {
-		if (policy->routines->balancing_select)
+		if (policy->routines->balancing_select) {
 			ret = policy->routines->balancing_select(policy, &e);
+			if (ret)
+				break;
+		}
 	}
 	// read_unlock_irqrestore(&saakm_rwlock, flags);
 	// rq_repin_lock(cpu_rq(core), &rf);
@@ -1042,7 +1045,7 @@ static struct task_struct *pick_task_saakm(struct rq *rq)
 	return next;
 }
 
-static struct task_struct *_pick_next_task_saakm(struct rq *rq, 
+struct task_struct *_pick_next_task_saakm(struct rq *rq, 
 						struct task_struct *prev,
 						struct rq_flags *rf)
 {
@@ -1124,7 +1127,8 @@ idle:
 	}
 	read_unlock_irqrestore(&saakm_rwlock, flags);
 end:
-	put_prev_set_next_task(rq, prev, next);
+	if (next)
+		put_prev_set_next_task(rq, prev, next);
 	return next;
 }
 
@@ -1315,19 +1319,53 @@ static void put_prev_task_saakm(struct rq *rq,
 
 #ifdef CONFIG_SMP
 
-/* TODO: balancing */
+/* 
+ * Balancing is called from prev_balance() right before
+ * pick_next_task(). We currently hold rq->__lock.
+ * Scan policices to see if we can find a task to run.
+ * If prev was not from saakm, 
+*/
 static int balance_saakm(struct rq *rq, struct task_struct *prev,
 			   struct rq_flags *rf)
 {
-	int ret;
-	if (rq->nr_running || !saakm_enabled())
-		return 1;
+	// struct saakm_policy *policy = NULL;
+	// struct core_event e = {
+	// 	.target = rq->cpu
+	// };
+
+	// int prev_on_saakm = prev->sched_class == &saakm_sched_class;
+
+	int ret = 0;
+	if (!saakm_enabled())
+		return 0;
 	
+	// rq_unpin_lock(rq, rf);
+
+	// list_for_each_entry(policy, &saakm_policies, list) {
+	// 	/* Core already idle, might be a candidate for balancing, or prev not on SaaKM */
+	// 	if (saakm_get_core_state(policy, rq->cpu) == SAAKM_IDLE_CORE) {
+	// 		ret = policy->routines->balancing_select(policy, &e);
+	// 		if (ret)
+	// 			break;
+	// 	} else {
+
+	// 	}
+			
+	// 	// if (policy->routines->balancing_select) {
+	// 	// 	ret = policy->routines->balancing_select(policy, &e);
+	// 	// 	if (ret)
+	// 	// 		break;
+	// 	// }
+	// }
+
 	rq_unpin_lock(rq, rf);
 	raw_spin_rq_unlock(rq);
 	ret = saakm_balancing_select();
 	raw_spin_rq_lock(rq);
 	rq_repin_lock(rq, rf);
+
+	/* Prev was from saakm and we have no more task to run,
+		we're about to become idle. */
 
 	return ret;
 }
@@ -1482,9 +1520,11 @@ static void task_tick_saakm(struct rq *rq,
 	 *
 	 * FIXME: not the case anymore. State transitions happen in tick().
 	 */
-	if (rq->cpu != task_cpu(curr))
+	if (rq->cpu != task_cpu(curr)) {
 		pr_warn("%s: rq->cpu=%d task_cpu(curr)=%d\n",
 			__func__, rq->cpu, task_cpu(curr));
+		kgdb_breakpoint();
+	}
 	saakm_tick(&e);
 }
 

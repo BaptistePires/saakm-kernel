@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+			// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  kernel/sched/core.c
  *
@@ -5966,7 +5966,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 	rq->dl_server = NULL;
 
-	if (scx_enabled() || saakm_enabled())
+	if (scx_enabled())
 		goto restart;
 
 	/*
@@ -5979,8 +5979,13 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 		   rq->nr_running == rq->cfs.h_nr_running)) {
 
 		p = pick_next_task_fair(rq, prev, rf);
-		if (unlikely(p == RETRY_TASK))
+		if (unlikely(p == RETRY_TASK)) {
+
+			p = _pick_next_task_saakm(rq, prev, rf);
+			if (p) 
 			goto restart;
+		}
+			
 
 		/* Assume the next prioritized class is idle_sched_class */
 		if (!p) {
@@ -5993,6 +5998,14 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 restart:
 	prev_balance(rq, prev, rf);
+
+	if (saakm_enabled()) {
+		struct task_struct *p;
+
+		p = _pick_next_task_saakm(rq, prev, rf);
+		if (p)
+			return p;
+	}
 
 	for_each_active_class(class) {
 		if (class->pick_next_task) {
