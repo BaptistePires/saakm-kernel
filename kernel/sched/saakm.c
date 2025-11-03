@@ -450,11 +450,12 @@ static int saakm_balancing_select(void)
 	struct saakm_policy *policy;
 	struct core_event e = { .target = core };
 	// struct rq_flags rf;
+	unsigned long flags;
 	int ret = 0;
 
 	// rq_unpin_lock(cpu_rq(core), &rf);
 	// TODO : temp fix to see if it works..
-	// read_lock_irqsave(&saakm_rwlock, flags);
+	read_lock_irqsave(&saakm_rwlock, flags);
 	list_for_each_entry(policy, &saakm_policies, list) {
 		if (policy->routines->balancing_select) {
 			ret = policy->routines->balancing_select(policy, &e);
@@ -462,7 +463,7 @@ static int saakm_balancing_select(void)
 				break;
 		}
 	}
-	// read_unlock_irqrestore(&saakm_rwlock, flags);
+	read_unlock_irqrestore(&saakm_rwlock, flags);
 	// rq_repin_lock(cpu_rq(core), &rf);
 	return ret;
 }
@@ -1080,6 +1081,8 @@ struct task_struct *_pick_next_task_saakm(struct rq *rq,
 		}
 	}
 
+	next = NULL;
+
 	/* First, we try to pick a task without doing load balancing or anything */
 	next = pick_task_saakm(rq);
 
@@ -1093,16 +1096,18 @@ struct task_struct *_pick_next_task_saakm(struct rq *rq,
 	}
 
 	/* We're switching, maybe fuse w/ prev test */
-	if (next != prev) {
-		__put_prev_set_next_dl_server(rq, prev, next);
-		return next;
-	}
+	// if (next != prev) {
+	// __put_prev_set_next_dl_server(rq, prev, next);
+	// }
+
+	// return next;
+	goto end;
 
 idle:
 	if (!rf)
 		return next;
 
-	/* We're idle and we got lock on rq(), do the idle balancing if needed */
+	/* We're idle and we got lock on rq(), do the idle balancing if needed FIX: locks*/
 	read_lock_irqsave(&saakm_rwlock, flags);
 	list_for_each_entry(policy, &saakm_policies, list) {
 		
@@ -1127,8 +1132,9 @@ idle:
 	}
 	read_unlock_irqrestore(&saakm_rwlock, flags);
 end:
-	if (next)
+	if (next && next != prev)
 		put_prev_set_next_task(rq, prev, next);
+
 	return next;
 }
 
@@ -1487,7 +1493,7 @@ static void set_next_task_saakm(struct rq *rq, struct task_struct *p, bool first
 	 * enqueue_task_saakm() which removes it from saakm_current and
 	 * puts it in READY state.
 	 */
-	if (per_cpu(saakm_current, rq->cpu) != rq->curr && (rq->curr->sched_class == &saakm_sched_class)) {
+	if (!first && per_cpu(saakm_current, rq->cpu) != rq->curr && (rq->curr->sched_class == &saakm_sched_class)) {
 		change_state(rq->curr, SAAKM_RUNNING, rq->cpu, NULL);
 	}
 	/* Update statistics. */
