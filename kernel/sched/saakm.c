@@ -6,6 +6,7 @@
 #include "linux/export.h"
 #include "linux/jump_label.h"
 #include "linux/mutex.h"
+#include "linux/rcupdate.h"
 #include "linux/sched.h"
 
 
@@ -22,6 +23,7 @@
 #include <linux/sched/cputime.h>
 #include <linux/mmu_context.h>
 
+#include "linux/spinlock_types.h"
 #include "sched.h"
 #include "saakm.h"
 
@@ -38,6 +40,8 @@ s64 num_saakm_policies;
 s64 saakm_policies_id;
 
 rwlock_t saakm_rwlock;
+
+DEFINE_SPINLOCK(saakm_list_policy_lock);
 
 /* Current running task per type */
 DEFINE_PER_CPU(struct task_struct *, saakm_current);
@@ -84,18 +88,20 @@ static bool __saakm_policy_exists_nolock(struct saakm_policy *policy)
 static bool saakm_policy_exists(struct saakm_policy *policy)
 {
 	bool ret;
-	unsigned long flags;
+	// unsigned long flags;
 
-	read_lock_irqsave(&saakm_rwlock, flags);
+	// read_lock_irqsave(&saakm_rwlock, flags);
+	rcu_read_lock();
 	ret = __saakm_policy_exists_nolock(policy);
-	read_unlock_irqrestore(&saakm_rwlock, flags);
+	rcu_read_unlock();
+	// read_unlock_irqrestore(&saakm_rwlock, flags);
 
 	return ret;
 }
 
 int saakm_add_policy(struct saakm_policy *policy)
 {
-	unsigned long flags;
+	// unsigned long flags;
 	int ret = 0;
 
 	/* Check if policy exists */
@@ -107,12 +113,13 @@ int saakm_add_policy(struct saakm_policy *policy)
 		return -EINVAL;
 
 	/* Let's set this up */
-	write_lock_irqsave(&saakm_rwlock, flags);
+	// write_lock_irqsave(&saakm_rwlock, flags);
+	// rcu_read_lock();
 	INIT_LIST_HEAD(&policy->list);
-	write_unlock_irqrestore(&saakm_rwlock, flags);
+	// write_unlock_irqrestore(&saakm_rwlock, flags);
 
 	/* Insert policy to activate it after checking existence again */
-	write_lock_irqsave(&saakm_rwlock, flags);
+	// write_lock_irqsave(&saakm_rwlock, flags);
 	if (__saakm_policy_exists_nolock(policy)) {
 		ret = -EINVAL;
 		goto end;
@@ -120,11 +127,14 @@ int saakm_add_policy(struct saakm_policy *policy)
 	ret = policy->routines->init(policy);
 	if (ret)
 		goto end;
-	policy->id = saakm_policies_id++;
-	list_add_tail(&policy->list, &saakm_policies);
 
+	spin_lock(&saakm_list_policy_lock);
+	policy->id = saakm_policies_id++;
+	list_add_tail_rcu(&policy->list, &saakm_policies);
+	spin_unlock(&saakm_list_policy_lock);
 end:
-	write_unlock_irqrestore(&saakm_rwlock, flags);
+	// rcu_read_unlock();
+	// write_unlock_irqrestore(&saakm_rwlock, flags);
 
 	if (!ret) {
 		mutex_lock(&saakm_policy_loaded_mutex);
@@ -138,20 +148,25 @@ EXPORT_SYMBOL(saakm_add_policy);
 
 int saakm_remove_policy(struct saakm_policy *policy)
 {
-	unsigned long flags;
+	// unsigned long flags;
 	int ret = 0;
 
+	rcu_read_lock();
 	/* Fail if policy is not inserted */
-	write_lock_irqsave(&saakm_rwlock, flags);
+	// write_lock_irqsave(&saakm_rwlock, flags);
 	if (!__saakm_policy_exists_nolock(policy)) {
 		ret = -EINVAL;
+		rcu_read_unlock();
 		goto end;
 	}
+	rcu_read_unlock();
 
-	list_del(&policy->list);
-
+	spin_lock(&saakm_list_policy_lock);
+	list_del_rcu(&policy->list);
+	spin_unlock(&saakm_list_policy_lock);
+	synchronize_rcu();
 end:
-	write_unlock_irqrestore(&saakm_rwlock, flags);
+	// write_unlock_irqrestore(&saakm_rwlock, flags);
 
 	
 	if (!ret) {
@@ -205,25 +220,29 @@ static int saakm_new_prepare(struct process_event *e)
 {
 	struct task_struct *p = e->target;
 	struct saakm_policy *policy;
-	unsigned long flags;
-
+	// unsigned long flags;
+	int ret;
 	/*
 	 * we acquire this lock to prevent the policy from being removed before
 	 * incrementing the refcount
 	 */
-	read_lock_irqsave(&saakm_rwlock, flags);
+	// read_lock_irqsave(&saakm_rwlock, flags);
 	policy = saakm_task_policy(p);
+
 	if (!policy || !try_module_get(policy->kmodule)) {
-		read_unlock_irqrestore(&saakm_rwlock, flags);
-		return -1;
+		// read_unlock_irqrestore(&saakm_rwlock, flags);
+		ret = -1;
+		goto out;
 	}
 
 	WARN(!policy->routines->new_prepare,
 	     "%s is NULL in policy %s\n", __func__, policy->name);
 
-	read_unlock_irqrestore(&saakm_rwlock, flags);
+	// read_unlock_irqrestore(&saakm_rwlock, flags);
 
-	return policy->routines->new_prepare(policy, e);
+	ret = policy->routines->new_prepare(policy, e);
+out:
+	return ret;
 }
 
 static void saakm_new_place(struct process_event *e)
@@ -369,6 +388,7 @@ static void saakm_terminate(struct process_event *e)
 
 	lockdep_assert_held(&rq->__lock);
 
+	rcu_read_lock();
 	policy = saakm_task_policy(p);
 
 	WARN(!policy->routines->terminate,
@@ -376,7 +396,10 @@ static void saakm_terminate(struct process_event *e)
 
 	policy->routines->terminate(policy, e);
 
-	saakm_task_policy(p) = NULL;
+	rcu_read_unlock();
+	rcu_assign_pointer(p->saakm.policy, NULL);
+	// saakm_task_policy(p) = NULL;
+
 	module_put(policy->kmodule);
 }
 
@@ -450,20 +473,21 @@ static int saakm_balancing_select(void)
 	struct saakm_policy *policy;
 	struct core_event e = { .target = core };
 	// struct rq_flags rf;
-	unsigned long flags;
+	// unsigned long flags;
 	int ret = 0;
-
+	rcu_read_lock();
 	// rq_unpin_lock(cpu_rq(core), &rf);
 	// TODO : temp fix to see if it works..
-	read_lock_irqsave(&saakm_rwlock, flags);
-	list_for_each_entry(policy, &saakm_policies, list) {
+	// read_lock_irqsave(&saakm_rwlock, flags);
+	list_for_each_entry_rcu(policy, &saakm_policies, list) {
 		if (policy->routines->balancing_select) {
 			ret = policy->routines->balancing_select(policy, &e);
 			if (ret)
 				break;
 		}
 	}
-	read_unlock_irqrestore(&saakm_rwlock, flags);
+	rcu_read_unlock();
+	// read_unlock_irqrestore(&saakm_rwlock, flags);
 	// rq_repin_lock(cpu_rq(core), &rf);
 	return ret;
 }
@@ -489,27 +513,35 @@ bool __checkparam_saakm(const struct sched_attr *attr,
 
 void __setparam_saakm(struct task_struct *p, const struct sched_attr *attr)
 {
+	rcu_read_lock();
 	struct saakm_policy *policy = saakm_task_policy(p);
 
 	if (policy->routines->setparam_attr)
 		policy->routines->setparam_attr(p, attr);
+	rcu_read_unlock();
 }
 
 void __getparam_saakm(struct task_struct *p, struct sched_attr *attr)
 {
+	rcu_read_lock();
 	struct saakm_policy *policy = saakm_task_policy(p);
 
 	if (policy->routines->getparam_attr)
 		policy->routines->getparam_attr(p, attr);
+	rcu_read_unlock();
 }
 
 bool saakm_attr_changed(struct task_struct *p, const struct sched_attr *attr)
 {
+	bool ret = false;
+	rcu_read_lock();
 	struct saakm_policy *policy = saakm_task_policy(p);
 
 	if (policy->routines->attr_changed)
-		return policy->routines->attr_changed(p, attr);
-	return false;
+		ret = policy->routines->attr_changed(p, attr);
+
+	rcu_read_unlock();
+	return ret;
 }
 
 /*
@@ -743,13 +775,15 @@ static void enqueue_task_saakm(struct rq *rq,
 {
 	struct process_event e = { .target = p, .cpu = smp_processor_id() };
 	enum saakm_core_state cstate;
-
+	struct saakm_policy *policy;
 	if (unlikely(saakm_sched_class_log))
 		pr_info("In %s [pid=%d, rq=%d]\n",
 			__func__, p->pid, rq->cpu);
 
+	rcu_read_lock();
+	policy = saakm_task_policy(p);
 	/* task has no saakm policy, just increment rq->nr_running */
-	if (!saakm_task_policy(p)) {
+	if (!policy) {
 		pr_warn("[WARN] %s: called on a task with no saakm policy set.\n",
 			__func__);
 		goto end;
@@ -805,10 +839,10 @@ static void enqueue_task_saakm(struct rq *rq,
 		 * If new_prepare() chose an IDLE cpu, we must call the
 		 * exit_idle() handler to wake it up on the policy
 		 */
-		cstate = saakm_get_core_state(saakm_task_policy(p),
+		cstate = saakm_get_core_state(policy,
 						rq->cpu);
 		if (cstate == SAAKM_IDLE_CORE)
-			saakm_exit_idle(saakm_task_policy(p),
+			saakm_exit_idle(policy,
 					  rq->cpu);
 		saakm_new_place(&e);
 		goto end;
@@ -831,10 +865,10 @@ static void enqueue_task_saakm(struct rq *rq,
 		 * If unblock_prepare() chose an IDLE cpu, we must call the
 		 * exit_idle() handler to wake it up on the policy
 		 */
-		cstate = saakm_get_core_state(saakm_task_policy(p),
+		cstate = saakm_get_core_state(policy,
 						rq->cpu);
 		if (cstate == SAAKM_IDLE_CORE)
-			saakm_exit_idle(saakm_task_policy(p),
+			saakm_exit_idle(policy,
 					  rq->cpu);
 		saakm_unblock_place(&e);
 		goto end;
@@ -853,6 +887,7 @@ static void enqueue_task_saakm(struct rq *rq,
 		       rq->cpu, rq, flags);
 
 end:
+	rcu_read_unlock();
 	add_nr_running(rq, 1);
 	rq->nr_saakm_running++;
 }
@@ -878,16 +913,17 @@ static bool dequeue_task_saakm(struct rq *rq,
 {
 	unsigned int state;
 	struct process_event e = { .target = p, .cpu = smp_processor_id(), .flags = flags};
-
+	struct saakm_policy *policy;
 
 	if (unlikely(saakm_sched_class_log))
 		pr_info("In %s [pid=%d, rq=%d, flags=%d]\n",
 			__func__, p->pid, rq->cpu, flags);
 
 	update_curr_saakm(rq);
-
+	rcu_read_lock();
+	policy = saakm_task_policy(p);
 	/* task has no saakm policy, just decrement rq->nr_running */
-	if (!saakm_task_policy(p)) {
+	if (!policy) {
 		pr_warn("[WARN] %s: called on a task with no saakm policy set.\n",
 			__func__);
 		goto end;
@@ -983,6 +1019,7 @@ static bool dequeue_task_saakm(struct rq *rq,
 		rq->cpu, rq, flags);
 
 end:
+	rcu_read_unlock();
 	sub_nr_running(rq, 1);
 	rq->nr_saakm_running--;
 	return true;
@@ -1028,20 +1065,20 @@ static void check_preempt_wakeup(struct rq *rq,
 static struct task_struct *pick_task_saakm(struct rq *rq)
 {
 	struct task_struct *next = NULL;
-	unsigned long flags;
+	// unsigned long flags;
 	struct saakm_policy *policy = NULL;
 
-	read_lock_irqsave(&saakm_rwlock, flags);
-
-	list_for_each_entry(policy, &saakm_policies, list) {
+	// read_lock_irqsave(&saakm_rwlock, flags);
+	rcu_read_lock();
+	list_for_each_entry_rcu(policy, &saakm_policies, list) {
 		saakm_schedule(policy, rq->cpu);
 
 		next = per_cpu(saakm_current, rq->cpu);
 		if (next)
 			break;
 	}
-
-	read_unlock_irqrestore(&saakm_rwlock, flags);
+	rcu_read_unlock();
+	// read_unlock_irqrestore(&saakm_rwlock, flags);
 
 	return next;
 }
@@ -1052,9 +1089,9 @@ struct task_struct *_pick_next_task_saakm(struct rq *rq,
 {
 	struct task_struct *next;
 	struct saakm_policy *policy;
-	unsigned long flags;
+	// unsigned long flags;
 	enum saakm_core_state cstate;
-
+	rcu_read_lock();
 	/*
 	 * If saakm_current is not NULL, it means that pick_next_task() is
 	 * called and neither yield(), block() or terminate() was called. This
@@ -1077,6 +1114,7 @@ struct task_struct *_pick_next_task_saakm(struct rq *rq,
 			/* yield to force preemption */
 			struct process_event e = { .target = next };
 
+			
 			saakm_yield(&e);
 		}
 	}
@@ -1104,13 +1142,15 @@ struct task_struct *_pick_next_task_saakm(struct rq *rq,
 	goto end;
 
 idle:
-	if (!rf)
-		return next;
+	if (!rf) {
+		goto end;
+	}
+		// return next;
 
 	/* We're idle and we got lock on rq(), do the idle balancing if needed FIX: locks*/
-	read_lock_irqsave(&saakm_rwlock, flags);
-	list_for_each_entry(policy, &saakm_policies, list) {
-		
+	// read_lock_irqsave(&saakm_rwlock, flags);
+	list_for_each_entry_rcu(policy, &saakm_policies, list) {
+
 		/*
 		 * Policy has no ready task on this cpu. If cpu is
 		 * already idle, try next policy. Else, call the
@@ -1130,13 +1170,133 @@ idle:
 		/* else call enter_idle() handler for this policy/cpu */
 		saakm_enter_idle(policy, rq->cpu);
 	}
-	read_unlock_irqrestore(&saakm_rwlock, flags);
+	// read_unlock_irqrestore(&saakm_rwlock, flags);
 end:
 	if (next && next != prev)
 		put_prev_set_next_task(rq, prev, next);
 
+	rcu_read_unlock();
 	return next;
 }
+// static struct task_struct *pick_task_saakm(struct rq *rq)
+// {
+// 	struct task_struct *next = NULL;
+// 	// unsigned long flags;
+// 	struct saakm_policy *policy = NULL;
+
+
+
+// 	// read_lock_irqsave(&saakm_rwlock, flags);
+// 	rcu_read_lock();
+// 	list_for_each_entry_rcu(policy, &saakm_policies, list) {
+// 		saakm_schedule(policy, rq->cpu);
+
+// 		next = per_cpu(saakm_current, rq->cpu);
+// 		if (next)
+// 			break;
+// 	}
+
+// 	rcu_read_unlock();
+
+// 	return next;
+// }
+
+// struct task_struct *_pick_next_task_saakm(struct rq *rq, 
+// 						struct task_struct *prev,
+// 						struct rq_flags *rf)
+// {
+// 	struct task_struct *next;
+// 	struct saakm_policy *policy;
+// 	// unsigned long flags;
+// 	enum saakm_core_state cstate;
+
+// 	/*
+// 	 * If saakm_current is not NULL, it means that pick_next_task() is
+// 	 * called and neither yield(), block() or terminate() was called. This
+// 	 * can happen in __schedule(), if the task is not RUNNABLE
+// 	 * (prev->state != 0) and has a pending signal. The task is therefore
+// 	 * not dequeued in order to handle the pending signals, and still in
+// 	 * saakm_current. For now, we keep the same task as saakm_current,
+// 	 * it will be removed when signals are handled (through a call to
+// 	 * dequeue and the correct saakm event handler).
+// 	 * This might also happen if __schedule() is called with preempt set to
+// 	 * true. This can happen with some syscalls. In this case, we want to
+// 	 * force a preemption, so we're going to simulate a yield().
+// 	 */
+// 	next = per_cpu(saakm_current, rq->cpu);
+// 	if (next) {
+// 		if (READ_ONCE(next->__state) != TASK_RUNNING) {
+// 			/* current has signals pending, leave it running */
+// 			goto end;
+// 		} else {
+// 			/* yield to force preemption */
+// 			struct process_event e = { .target = next };
+
+// 			saakm_yield(&e);
+// 		}
+// 	}
+
+// 	if (!rf)
+// 		return next;
+
+// 	rq_unpin_lock(rq, rf);
+// 	rq_unlock(rq, rf);
+// 	/* First, we try to pick a task without doing load balancing or anything */
+// 	next = pick_task_saakm(rq);
+// 	rq_repin_lock(rq, rf);
+// 	rq_lock(rq, rf);
+// 	/* There is no available tasks, go to idle handling */
+// 	if (!next)
+// 		goto idle;
+
+// 	/* @prev was not an saakm task */
+// 	if (prev->sched_class != &saakm_sched_class) {
+// 		goto end;
+// 	}
+
+// 	/* We're switching, maybe fuse w/ prev test */
+// 	// if (next != prev) {
+// 	// __put_prev_set_next_dl_server(rq, prev, next);
+// 	// }
+
+// 	// return next;
+// 	goto end;
+
+// idle:
+
+
+// 	/* We're idle and we got lock on rq(), do the idle balancing if needed FIX: locks*/
+// 	// read_lock_irqsave(&saakm_rwlock, flags);
+// 	rcu_read_lock();
+// 	list_for_each_entry_rcu(policy, &saakm_policies, list) {
+
+// 		/*
+// 		 * Policy has no ready task on this cpu. If cpu is
+// 		 * already idle, try next policy. Else, call the
+// 		 * newly_idle() event and retry once.
+// 		 */
+// 		cstate = saakm_get_core_state(policy, rq->cpu);
+// 		if (cstate == SAAKM_IDLE_CORE)
+// 			continue;
+
+// 		saakm_newly_idle(policy, rq->cpu, rf);
+
+// 		saakm_schedule(policy, rq->cpu);
+// 		next = per_cpu(saakm_current, rq->cpu);
+// 		/* if a task is found, schedule it */
+// 		if (next)
+// 			break;
+// 		/* else call enter_idle() handler for this policy/cpu */
+// 		saakm_enter_idle(policy, rq->cpu);
+// 	}
+// 	rcu_read_unlock();
+// 	// read_unlock_irqrestore(&saakm_rwlock, flags);
+// end:
+// 	if (next && next != prev)
+// 		put_prev_set_next_task(rq, prev, next);
+
+// 	return next;
+// }
 
 
 // static struct task_struct *pick_next_task_saakm(struct rq *rq,
@@ -1246,7 +1406,7 @@ static void put_prev_task_saakm(struct rq *rq,
 {
 	enum saakm_state state;
 	struct process_event e = { .target = prev, .cpu = smp_processor_id() };
-
+	struct saakm_policy *prev_policy;
 	if (unlikely(saakm_sched_class_log))
 		pr_info("In %s [pid=%d, rq=%d]\n",
 			__func__, prev->pid, rq->cpu);
@@ -1259,15 +1419,18 @@ static void put_prev_task_saakm(struct rq *rq,
 		BUG();
 	}
 
+	rcu_read_lock();
+	prev_policy = saakm_task_policy(prev);
 	/*
 	 * If no policy is set, we are moving out from an saakm policy,
 	 * dequeue_task_saakm() already called terminate(). We just remove
 	 * prev from saakm_current if necessary. We don't call resched_curr()
 	 * because the task will keep the cpu in its new sched_class.
 	 */
-	if (!prev->saakm.policy) {
+	if (!prev_policy) {
 		if (per_cpu(saakm_current, task_cpu(prev)) == prev)
 			per_cpu(saakm_current, task_cpu(prev)) = NULL;
+		rcu_read_unlock();
 		return;
 	}
 
@@ -1321,6 +1484,8 @@ static void put_prev_task_saakm(struct rq *rq,
 		pr_warn("[WARN] %s[pid=%d]: Invalid state %d.\n",
 			__func__, prev->pid, state);
 	}
+
+	rcu_read_unlock();
 }
 
 #ifdef CONFIG_SMP
@@ -1382,7 +1547,7 @@ static int select_task_rq_saakm(struct task_struct *p,
 {
 	struct process_event e = { .target = p, .cpu = smp_processor_id(), .flags = wake_flags };
 	int ret = task_cpu(p);
-
+	struct saakm_policy *policy;
 	if (unlikely(saakm_sched_class_log))
 		pr_info("In %s [pid=%d]\n",
 			__func__, p->pid);
@@ -1395,12 +1560,14 @@ static int select_task_rq_saakm(struct task_struct *p,
 		return task_cpu(p);
 	}
 
+	rcu_read_lock();
+	policy = saakm_task_policy(p);
 	/*
 	 * If state == SAAKM_NOT_QUEUED, p is a forked process that
 	 * will soon be enqueued. We must call new_prepare() event.
 	 */
 	if (saakm_task_state(p) == SAAKM_NOT_QUEUED) {
-		if (!saakm_task_policy(p))
+		if (!policy)
 			pr_err("[ERR] %s: p is SAAKM_NOT_QUEUED and policy is NULL. Shouldn't happen\n",
 			       __func__);
 		saakm_task_rq(p) = NULL;
@@ -1408,7 +1575,7 @@ static int select_task_rq_saakm(struct task_struct *p,
 		if (ret < 0) {
 			pr_warn("[WARN] %s: new_prepare failed (pid=%d, policy=%llu), reverting to p->cpu\n",
 				__func__, p->pid,
-				saakm_task_policy(p)->id);
+				policy->id);
 			ret = task_cpu(p);
 		}
 	} else if (READ_ONCE(p->__state) == TASK_WAKING) {
@@ -1422,6 +1589,7 @@ static int select_task_rq_saakm(struct task_struct *p,
 			rq_unlock(task_rq(p), &rf);
 		}
 	}
+	rcu_read_unlock();
 
 	return ret;
 }
@@ -1441,8 +1609,10 @@ static void rq_online_saakm(struct rq *rq)
 		pr_info("In %s [rq=%d]\n",
 			__func__, rq->cpu);
 
-	list_for_each_entry(policy, &saakm_policies, list)
+	rcu_read_lock();		
+	list_for_each_entry_rcu(policy, &saakm_policies, list)
 		saakm_core_entry(policy, rq->cpu);
+	rcu_read_unlock();
 }
 
 static void rq_offline_saakm(struct rq *rq)
@@ -1453,8 +1623,10 @@ static void rq_offline_saakm(struct rq *rq)
 		pr_info("In %s [rq=%d]\n",
 			__func__, rq->cpu);
 
-	list_for_each_entry(policy, &saakm_policies, list)
+	rcu_read_lock();
+	list_for_each_entry_rcu(policy, &saakm_policies, list)
 		saakm_core_exit(policy, rq->cpu);
+	rcu_read_unlock();
 }
 
 static void task_woken_saakm(struct rq *this_rq, struct task_struct *p)
@@ -1475,7 +1647,7 @@ static void task_dead_saakm(struct task_struct *p)
 		       __func__, p,
 		       p->sched_class != &saakm_sched_class);
 
-	saakm_task_policy(p) = NULL;
+	rcu_assign_pointer(p->saakm.policy, NULL);
 	saakm_task_state(p) = SAAKM_NOT_QUEUED;
 }
 #endif
@@ -1531,7 +1703,9 @@ static void task_tick_saakm(struct rq *rq,
 			__func__, rq->cpu, task_cpu(curr));
 		kgdb_breakpoint();
 	}
+	rcu_read_lock();
 	saakm_tick(&e);
+	rcu_read_unlock();
 }
 
 static void task_fork_saakm(struct task_struct *p)

@@ -51,6 +51,7 @@
 
 #include <asm/switch_to.h>
 
+#include "asm/kgdb.h"
 #include "sched.h"
 #include "stats.h"
 #include "autogroup.h"
@@ -5660,6 +5661,9 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 		/* in !on_rq case, update occurred at dequeue */
 		update_load_avg(cfs_rq, prev, 0);
 	}
+
+	if (cfs_rq->curr != prev)
+		arch_kgdb_breakpoint();
 	SCHED_WARN_ON(cfs_rq->curr != prev);
 	cfs_rq->curr = NULL;
 }

@@ -5966,7 +5966,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 	rq->dl_server = NULL;
 
-	if (scx_enabled())
+	if (scx_enabled() || saakm_enabled())
 		goto restart;
 
 	/*
@@ -5980,9 +5980,6 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 		p = pick_next_task_fair(rq, prev, rf);
 		if (unlikely(p == RETRY_TASK)) {
-
-			p = _pick_next_task_saakm(rq, prev, rf);
-			if (p) 
 			goto restart;
 		}
 			

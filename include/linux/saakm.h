@@ -159,7 +159,7 @@ int count(enum saakm_state state, unsigned int cpu);
 #define policy_metadata(t)         ((t)->saakm.policy_metadata)
 #define saakm_task_state(p)      ((p)->saakm.state)
 #define saakm_task_rq(p)         ((p)->saakm.rq)
-#define saakm_task_policy(p)     ((p)->saakm.policy)
+#define saakm_task_policy(p)     (rcu_dereference((p)->saakm.policy))
 
 /*
  * Accessors used in policy modules

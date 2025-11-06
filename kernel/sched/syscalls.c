@@ -13,6 +13,7 @@
 
 #include <uapi/linux/sched/types.h>
 
+#include "linux/rcupdate.h"
 #include "sched.h"
 #include "autogroup.h"
 #include "saakm.h"
@@ -658,15 +659,16 @@ recheck:
 		}
 #endif	/* CONFIG_CGROUP_SAAKM */
 
-		read_lock(&saakm_rwlock);
-		list_for_each_entry(cur_policy, &saakm_policies, list) {
+		// read_lock(&saakm_rwlock);
+		rcu_read_lock();
+		list_for_each_entry_rcu(cur_policy, &saakm_policies, list) {
 			if (cur_policy->id == ipa_policy) {
 				found = 1;
-				saakm_task_policy(p) = cur_policy;
+				rcu_assign_pointer(p->saakm.policy, cur_policy);
 				break;
 			}
 		}
-		read_unlock(&saakm_rwlock);
+		rcu_read_unlock();
 		if (!found || !__checkparam_saakm(attr, cur_policy)) {
 			retval = -EINVAL;
 			goto unlock;
