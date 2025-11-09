@@ -5966,7 +5966,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 	rq->dl_server = NULL;
 
-	if (scx_enabled())
+	if (scx_enabled() || saakm_enabled())
 		goto restart;
 
 	/*
@@ -5980,12 +5980,8 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 		p = pick_next_task_fair(rq, prev, rf);
 		if (unlikely(p == RETRY_TASK)) {
-
-			p = _pick_next_task_saakm(rq, prev, rf);
-			if (p) 
 			goto restart;
 		}
-			
 
 		/* Assume the next prioritized class is idle_sched_class */
 		if (!p) {
@@ -5999,17 +5995,21 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 restart:
 	prev_balance(rq, prev, rf);
 
-	if (saakm_enabled()) {
-		struct task_struct *p;
+	// if (saakm_enabled()) {
+	// 	struct task_struct *p;
 
-		p = _pick_next_task_saakm(rq, prev, rf);
-		if (p)
-			return p;
-	}
+	// 	p = _pick_next_task_saakm(rq, prev, rf);
+	// 	if (p)
+	// 		return p;
+	// }
 
 	for_each_active_class(class) {
 		if (class->pick_next_task) {
-			p = class->pick_next_task(rq, prev);
+			if (class == &saakm_sched_class)
+				p = _pick_next_task_saakm(rq, prev, rf);
+			else
+				p = class->pick_next_task(rq, prev);
+
 			if (p)
 				return p;
 		} else {

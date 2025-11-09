@@ -1089,19 +1089,8 @@ struct task_struct *_pick_next_task_saakm(struct rq *rq,
 	/* There is no available tasks, go to idle handling */
 	if (!next)
 		goto idle;
-
-	/* @prev was not an saakm task */
-	if (prev->sched_class != &saakm_sched_class) {
+	else
 		goto end;
-	}
-
-	/* We're switching, maybe fuse w/ prev test */
-	// if (next != prev) {
-	// __put_prev_set_next_dl_server(rq, prev, next);
-	// }
-
-	// return next;
-	goto end;
 
 idle:
 	if (!rf)
@@ -1138,103 +1127,6 @@ end:
 	return next;
 }
 
-
-// static struct task_struct *pick_next_task_saakm(struct rq *rq,
-// 						    struct task_struct *prev,
-// 						    struct rq_flags *rf)
-// {
-// 	struct task_struct *result = NULL;
-// 	struct saakm_policy *policy = NULL;
-// 	enum saakm_core_state cstate;
-// 	unsigned long flags;
-
-// 	if (unlikely(saakm_sched_class_log))
-// 		pr_info("In %s [pid=%d, rq=%d]\n", __func__,
-// 			prev ? prev->pid : -1, rq->cpu);
-
-// 	/*
-// 	 * If saakm_current is not NULL, it means that pick_next_task() is
-// 	 * called and neither yield(), block() or terminate() was called. This
-// 	 * can happen in __schedule(), if the task is not RUNNABLE
-// 	 * (prev->state != 0) and has a pending signal. The task is therefore
-// 	 * not dequeued in order to handle the pending signals, and still in
-// 	 * saakm_current. For now, we keep the same task as saakm_current,
-// 	 * it will be removed when signals are handled (through a call to
-// 	 * dequeue and the correct saakm event handler).
-// 	 * This might also happen if __schedule() is called with preempt set to
-// 	 * true. This can happen with some syscalls. In this case, we want to
-// 	 * force a preemption, so we're going to simulate a yield().
-// 	 */
-// 	result = per_cpu(saakm_current, rq->cpu);
-// 	if (result) {
-// 		if (READ_ONCE(result->__state) != TASK_RUNNING) {
-// 			/* current has signals pending, leave it running */
-// 			goto end;
-// 		} else {
-// 			/* yield to force preemption */
-// 			struct process_event e = { .target = current };
-
-// 			saakm_yield(&e);
-// 		}
-// 	}
-
-// 	if (prev->sched_class != &saakm_sched_class) {
-// 		/* We are switching to another scheduling class */
-// 		result = pick_task_saakm(rq);
-// 		goto end;
-// 	}
-
-
-// 	read_lock_irqsave(&saakm_rwlock, flags);
-// 	list_for_each_entry(policy, &saakm_policies, list) {
-// 		saakm_schedule(policy, rq->cpu);
-// 		result = per_cpu(saakm_current, rq->cpu);
-// 		/* if a task is found, schedule it */
-// 		if (result)
-// 			break;
-// 		/*
-// 		 * Policy has no ready task on this cpu. If cpu is
-// 		 * already idle, try next policy. Else, call the
-// 		 * newly_idle() event and retry once.
-// 		 */
-// 		cstate = saakm_get_core_state(policy, rq->cpu);
-// 		if (cstate == SAAKM_IDLE_CORE)
-// 			continue;
-
-// 		if (!rf)
-// 			continue;
-// 		saakm_newly_idle(policy, rq->cpu, rf);
-
-// 		saakm_schedule(policy, rq->cpu);
-// 		result = per_cpu(saakm_current, rq->cpu);
-// 		/* if a task is found, schedule it */
-// 		if (result)
-// 			break;
-// 		/* else call enter_idle() handler for this policy/cpu */
-// 		saakm_enter_idle(policy, rq->cpu);
-// 	}
-// 	read_unlock_irqrestore(&saakm_rwlock, flags);
-// end:
-// 	if (!result)
-// 		goto end;
-
-// 	if (result != prev) {
-// 		if (prev)
-// 			put_prev_task(rq, prev);
-// 		result->se.exec_start = rq_clock_task(rq);
-// 	}
-
-// 	if (saakm_task_state(result) != SAAKM_RUNNING) {
-// 		pr_warn("[WARN] %s: picked task is not SAAKM_RUNNING (%s instead). Switching to SAAKM_RUNNING to prevent issues, but we shouldn't be in this situation!\n",
-// 			__func__,
-// 			saakm_state_to_str(saakm_task_state(current)));
-// 		saakm_task_state(result) = SAAKM_RUNNING;
-// 	}
-
-
-// 	return result;
-// }
-// 
 static struct task_struct *__pick_next_task_saakm(struct rq *rq, struct task_struct *prev)
 {
 	return _pick_next_task_saakm(rq, prev, NULL);
@@ -1341,39 +1233,39 @@ static int balance_saakm(struct rq *rq, struct task_struct *prev,
 
 	// int prev_on_saakm = prev->sched_class == &saakm_sched_class;
 
-	int ret = 0;
-	if (!saakm_enabled())
-		return 0;
+	// int ret = 0;
+	// if (!saakm_enabled())
+	// 	return 0;
 	
-	// rq_unpin_lock(rq, rf);
+	// // rq_unpin_lock(rq, rf);
 
-	// list_for_each_entry(policy, &saakm_policies, list) {
-	// 	/* Core already idle, might be a candidate for balancing, or prev not on SaaKM */
-	// 	if (saakm_get_core_state(policy, rq->cpu) == SAAKM_IDLE_CORE) {
-	// 		ret = policy->routines->balancing_select(policy, &e);
-	// 		if (ret)
-	// 			break;
-	// 	} else {
+	// // list_for_each_entry(policy, &saakm_policies, list) {
+	// // 	/* Core already idle, might be a candidate for balancing, or prev not on SaaKM */
+	// // 	if (saakm_get_core_state(policy, rq->cpu) == SAAKM_IDLE_CORE) {
+	// // 		ret = policy->routines->balancing_select(policy, &e);
+	// // 		if (ret)
+	// // 			break;
+	// // 	} else {
 
-	// 	}
+	// // 	}
 			
-	// 	// if (policy->routines->balancing_select) {
-	// 	// 	ret = policy->routines->balancing_select(policy, &e);
-	// 	// 	if (ret)
-	// 	// 		break;
-	// 	// }
-	// }
+	// // 	// if (policy->routines->balancing_select) {
+	// // 	// 	ret = policy->routines->balancing_select(policy, &e);
+	// // 	// 	if (ret)
+	// // 	// 		break;
+	// // 	// }
+	// // }
 
-	rq_unpin_lock(rq, rf);
-	raw_spin_rq_unlock(rq);
-	ret = saakm_balancing_select();
-	raw_spin_rq_lock(rq);
-	rq_repin_lock(rq, rf);
+	// rq_unpin_lock(rq, rf);
+	// raw_spin_rq_unlock(rq);
+	// ret = saakm_balancing_select();
+	// raw_spin_rq_lock(rq);
+	// rq_repin_lock(rq, rf);
 
 	/* Prev was from saakm and we have no more task to run,
 		we're about to become idle. */
 
-	return ret;
+	return saakm_enabled() ? 1 : 0;
 }
 
 static int select_task_rq_saakm(struct task_struct *p,
