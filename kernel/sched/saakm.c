@@ -870,6 +870,7 @@ static void update_curr_saakm(struct rq *rq)
 	delta_exec = update_curr_common(rq);
 	if (unlikely((s64)delta_exec <= 0))
 		return;
+
 }
 
 static bool dequeue_task_saakm(struct rq *rq,
@@ -1226,45 +1227,6 @@ static void put_prev_task_saakm(struct rq *rq,
 static int balance_saakm(struct rq *rq, struct task_struct *prev,
 			   struct rq_flags *rf)
 {
-	// struct saakm_policy *policy = NULL;
-	// struct core_event e = {
-	// 	.target = rq->cpu
-	// };
-
-	// int prev_on_saakm = prev->sched_class == &saakm_sched_class;
-
-	// int ret = 0;
-	// if (!saakm_enabled())
-	// 	return 0;
-	
-	// // rq_unpin_lock(rq, rf);
-
-	// // list_for_each_entry(policy, &saakm_policies, list) {
-	// // 	/* Core already idle, might be a candidate for balancing, or prev not on SaaKM */
-	// // 	if (saakm_get_core_state(policy, rq->cpu) == SAAKM_IDLE_CORE) {
-	// // 		ret = policy->routines->balancing_select(policy, &e);
-	// // 		if (ret)
-	// // 			break;
-	// // 	} else {
-
-	// // 	}
-			
-	// // 	// if (policy->routines->balancing_select) {
-	// // 	// 	ret = policy->routines->balancing_select(policy, &e);
-	// // 	// 	if (ret)
-	// // 	// 		break;
-	// // 	// }
-	// // }
-
-	// rq_unpin_lock(rq, rf);
-	// raw_spin_rq_unlock(rq);
-	// ret = saakm_balancing_select();
-	// raw_spin_rq_lock(rq);
-	// rq_repin_lock(rq, rf);
-
-	/* Prev was from saakm and we have no more task to run,
-		we're about to become idle. */
-
 	return saakm_enabled() ? 1 : 0;
 }
 
@@ -1389,7 +1351,7 @@ static void set_next_task_saakm(struct rq *rq, struct task_struct *p, bool first
 		change_state(rq->curr, SAAKM_RUNNING, rq->cpu, NULL);
 	}
 	/* Update statistics. */
-	rq->curr->se.exec_start = rq_clock_task(rq);
+	p->se.exec_start = rq_clock_task(rq);
 }
 
 static void task_tick_saakm(struct rq *rq,
