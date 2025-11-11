@@ -1421,8 +1421,8 @@ static void task_tick_saakm(struct rq *rq,
 	if (rq->cpu != task_cpu(curr)) {
 		pr_warn("%s: rq->cpu=%d task_cpu(curr)=%d\n",
 			__func__, rq->cpu, task_cpu(curr));
-		kgdb_breakpoint();
 	}
+
 	saakm_tick(&e);
 }
 
@@ -1478,6 +1478,25 @@ static void switched_to_saakm(struct rq *rq, struct task_struct *p)
 		lockdep_assert_held(&rq->__lock);
 		resched_curr(rq);
 	}
+}
+
+static void reweight_task_saakm(struct rq *rq, struct task_struct *p,
+					const struct load_weight *lw)
+{
+	struct saakm_policy *policy = saakm_task_policy(p);
+
+	if (unlikely(saakm_sched_class_log))
+		pr_info("In %s [pid=%d, rq=%d]\n",
+			__func__, p->pid, rq->cpu);
+	if (!policy) {
+		pr_warn("[WARN] %s: called on a task with no saakm policy set.\n",
+			__func__);
+		return;
+	}
+
+	if (policy->routines->reweight_task)
+		policy->routines->reweight_task(policy, p, lw);
+
 }
 
 static unsigned int get_rr_interval_saakm(struct rq *rq,
@@ -1538,7 +1557,7 @@ DEFINE_SCHED_CLASS(saakm) = {
 	.prio_changed	        = prio_changed_saakm,
 	.switched_from	        = switched_from_saakm,
 	.switched_to		= switched_to_saakm,
-
+	.reweight_task		= reweight_task_saakm,
 	.get_rr_interval	= get_rr_interval_saakm,
 
 	.update_curr		= update_curr_saakm,

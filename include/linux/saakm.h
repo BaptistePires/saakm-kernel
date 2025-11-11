@@ -107,6 +107,9 @@ struct saakm_module_routines {
 			      struct sched_attr *attr);
 	bool (*attr_changed)(struct task_struct *p,
 			     const struct sched_attr *attr);
+	void (*reweight_task)(struct saakm_policy *policy,
+			      struct task_struct *p,
+			      const struct load_weight *new_weight);
 
 	int (*init)(struct saakm_policy *policy);
 	int (*free_metadata)(struct saakm_policy *policy);
