@@ -18,3 +18,23 @@ requirements for building and running the kernel, and information about
 the problems which may result by upgrading your kernel.
 
 This work was carried out as part of Baptiste Pires' PhD thesis at the LIP6 in the Delys team. The thesis director is Pierre Sens, and the supervisors are : Swan Dubois, Redha Gouicem and Julien Sopena. This thesis is part of the BPI Project - FogSLA‑Antillas project (DOS0168403/00‑DOS0168405/00).
+
+
+Policies benchmarks vs EEVDF
+============
+The table reports the performance impact of the evaluated scheduling policies relative to EEVDF, expressed as percentage change, where positive values indicate improvements over EEVDF and negative values indicate regressions.
+| Benchmark              | FIFO policy sched_ext | FIFO policy SaaKM | vruntime policy sched_ext | vruntime policy SaaKM | Per app mean |
+|------------------------|-----------------------|-------------------|---------------------------|-----------------------|--------------|
+| blender                | 1.44%                 | 1.31%             | 1.47%                     | 1.21%                 | 1.36%        |
+| build-linux-kernel     | -0.50%                | -0.26%            | -0.18%                    | -0.39%                | -0.33%       |
+| cassandra              | 11.66%                | 10.25%            | 10.87%                    | 12.15%                | 11.23%       |
+| cockroach              | 5.97%                 | 6.71%             | 6.18%                     | 6.91%                 | 6.44%        |
+| 7zip compression       | -9.58%                | -4.85%            | -9.87%                    | -4.89%                | -7.30%       |
+| 7zip decompression     | -1.12%                | -0.95%            | -0.75%                    | -1.03%                | -0.96%       |
+| hackbench              | -1.73%                | -1.27%            | 1.69%                     | 2.09%                 | 0.20%        |
+| memcached              | 9.73%                 | 10.25%            | 0.89%                     | 1.80%                 | 5.67%        |
+| nginx                  | 11.61%                | 11.74%            | 7.09%                     | 7.79%                 | 9.56%        |
+| pgbench latency        | -30.85%               | -21.89%           | -43.23%                   | -41.72%               | -34.42%      |
+| pgbench tps            | -23.56%               | -17.98%           | -30.18%                   | -29.54%               | -25.32%      |
+| x265                   | 7.10%                 | 7.03%             | 7.79%                     | 7.08%                 | 7.25%        |
+
